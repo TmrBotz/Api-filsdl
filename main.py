@@ -23,9 +23,9 @@ FILESDL_HEADERS = {
 async def fetch_direct_url(cloud_type: str, file_id: str) -> dict:
     """
     new1.filesdl.in/cloud/{id} page se direct download URL nikalo.
-    Priority 1: Fast Direct (zdownload/fdownload)
+    Priority 1: Pixeldrain
     Priority 2: Cloud Direct (r2.dev)
-    Priority 3: Pixeldrain
+    Priority 3: Fast Direct (zdownload/fdownload)
     """
     target = f"https://new1.filesdl.in/{cloud_type}/{file_id}"
 
@@ -36,13 +36,11 @@ async def fetch_direct_url(cloud_type: str, file_id: str) -> dict:
                 return {"error": f"filesdl returned HTTP {resp.status}", "status": resp.status}
             html = await resp.text()
 
-    # Priority 1: Fast Direct (zdownload + fdownload)
-    fast = (
-        re.search(r'href=\'(https://bbbdownload\.filesdl\.in/(?:fdownload|zdownload)\.php[^\']+)\'', html) or
-        re.search(r'href=\'(https://bbdownload\.filesdl\.in/(?:fdownload|zdownload)\.php[^\']+)\'', html)
-    )
-    if fast:
-        return {"url": fast.group(1), "method": "Fast Direct"}
+    # Priority 1: Pixeldrain
+    pixel = re.search(r'href=\'(https://aws_amzdlbuket\.iwebp\.store/u/([^?\']+)\?download)\'', html)
+    if pixel:
+        pixel_id = pixel.group(2)
+        return {"url": f"https://pixeldrain.dev/api/file/{pixel_id}?download", "method": "Pixeldrain"}
 
     # Priority 2: Cloud Direct (r2.dev)
     cloud = re.search(r'href=\'([^\']*r2\.dev[^\']+)\'\s*class=\'button2 download-link\'\s*data-id=\'0\'', html)
@@ -50,11 +48,13 @@ async def fetch_direct_url(cloud_type: str, file_id: str) -> dict:
         url = cloud.group(1).split("&token=")[0]
         return {"url": url, "method": "Cloud Direct"}
 
-    # Priority 3: Pixeldrain
-    pixel = re.search(r'href=\'(https://aws_amzdlbuket\.iwebp\.store/u/([^?\']+)\?download)\'', html)
-    if pixel:
-        pixel_id = pixel.group(2)
-        return {"url": f"https://pixeldrain.dev/api/file/{pixel_id}?download", "method": "Pixeldrain"}
+    # Priority 3: Fast Direct (zdownload + fdownload)
+    fast = (
+        re.search(r'href=\'(https://bbbdownload\.filesdl\.in/(?:fdownload|zdownload)\.php[^\']+)\'', html) or
+        re.search(r'href=\'(https://bbdownload\.filesdl\.in/(?:fdownload|zdownload)\.php[^\']+)\'', html)
+    )
+    if fast:
+        return {"url": fast.group(1), "method": "Fast Direct"}
 
     return {"error": "No download link found", "status": 404}
 
