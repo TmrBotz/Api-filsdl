@@ -1,6 +1,7 @@
 """
 FileDL Proxy Server
 GET /?url=https://new1.filesdl.in/cloud/ID
+GET /?url=https://new1.filesdl.in/drive/ID
 First download link return karta hai JSON mein.
 """
 
@@ -21,9 +22,14 @@ FILESDL_HEADERS = {
     "Referer": "https://filmyfly.faith/",
 }
 
+
 def xor_decrypt(p: str, k: str) -> str:
-    a = base64.b64decode(p + "==")
-    b = base64.b64decode(k + "==")
+    # Pad to multiple of 4 properly
+    def pad(s):
+        return s + "=" * (-len(s) % 4)
+
+    a = base64.b64decode(pad(p))
+    b = base64.b64decode(pad(k))
     return bytes([v ^ b[i % len(b)] for i, v in enumerate(a)]).decode("utf-8", errors="ignore")
 
 
@@ -31,55 +37,115 @@ def extract_links(html: str) -> list[dict]:
     results = []
     seen_urls = set()
 
-    pattern = re.compile(
+    # Pattern 1: buttonv2-download-button class wale spans (cloud pages)
+    pattern1 = re.compile(
         r'<span[^>]+class=[\'"]([^\'"]*buttonv2-download-button[^\'"]*)[\'"][^>]+'
         r'data-p=[\'"]([^\'"]+)[\'"][^>]+'
         r'data-k=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</span>',
         re.DOTALL
     )
 
-    for m in pattern.finditer(html):
-        data_p     = m.group(2).strip()
-        data_k     = m.group(3).strip()
-        inner_html = m.group(4).strip()
+    # Pattern 2: Any element with data-p and data-k attributes (drive pages)
+    pattern2 = re.compile(
+        r'<(?:span|a|button|div)[^>]+'
+        r'data-p=[\'"]([^\'"]+)[\'"][^>]+'
+        r'data-k=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</(?:span|a|button|div)>',
+        re.DOTALL
+    )
 
+    # Pattern 3: data-k aage bhi ho sakta hai data-p se pehle
+    pattern3 = re.compile(
+        r'<(?:span|a|button|div)[^>]+'
+        r'data-k=[\'"]([^\'"]+)[\'"][^>]+'
+        r'data-p=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</(?:span|a|button|div)>',
+        re.DOTALL
+    )
+
+    def process_match(data_p, data_k, inner_html):
         label = re.sub(r'<[^>]+>', '', inner_html).strip()
-
         try:
-            url = xor_decrypt(data_p, data_k)
+            url = xor_decrypt(data_p.strip(), data_k.strip())
         except Exception:
-            continue
-
+            return
         if not url.startswith("http"):
-            continue
-
+            return
         if url in seen_urls:
-            continue
+            return
         seen_urls.add(url)
+        results.append({"label": label or "Download", "url": url})
 
-        results.append({"label": label, "url": url})
+    for m in pattern1.finditer(html):
+        process_match(m.group(2), m.group(3), m.group(4))
+
+    # Pattern 2 se (p pehle, k baad)
+    for m in pattern2.finditer(html):
+        process_match(m.group(1), m.group(2), m.group(3))
+
+    # Pattern 3 se (k pehle, p baad)
+    for m in pattern3.finditer(html):
+        # group(1) = data-k, group(2) = data-p
+        process_match(m.group(2), m.group(1), m.group(3))
 
     return results
+
+
+def extract_meta(html: str) -> tuple[str, str]:
+    """Title aur size extract karo — multiple patterns try karta hai."""
+
+    # Title patterns
+    title = ""
+    for pat in [
+        r"<div[^>]+class=['\"]title['\"][^>]*>([^<]+)</div>",
+        r"<div[^>]+class=['\"][^'\"]*title[^'\"]*['\"][^>]*>([^<]+)</div>",
+        r"<h1[^>]*>([^<]+)</h1>",
+        r"<title>([^<]+)</title>",
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            title = m.group(1).strip()
+            break
+
+    # Size patterns
+    size = ""
+    for pat in [
+        r"<div[^>]+class=['\"]info['\"][^>]*>Size:\s*([^<]+)</div>",
+        r"Size:\s*<[^>]+>([^<]+)<",
+        r"Size:\s*([\d.,]+\s*(?:MB|GB|KB))",
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            size = m.group(1).strip()
+            break
+
+    return title, size
 
 
 async def fetch_links(target_url: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(target_url, headers=FILESDL_HEADERS, allow_redirects=True) as resp:
+        async with session.get(
+            target_url,
+            headers=FILESDL_HEADERS,
+            allow_redirects=True
+        ) as resp:
             if resp.status != 200:
-                return {"error": f"filesdl returned HTTP {resp.status}", "status": resp.status}
+                return {
+                    "error": f"filesdl returned HTTP {resp.status}",
+                    "status": resp.status
+                }
             html = await resp.text()
 
-    title_m = re.search(r"<div class='title'>([^<]+)</div>", html)
-    title = title_m.group(1).strip() if title_m else ""
-
-    size_m = re.search(r"<div class='info'>Size:\s*([^<]+)</div>", html)
-    size = size_m.group(1).strip() if size_m else ""
-
+    title, size = extract_meta(html)
     links = extract_links(html)
 
     if not links:
-        return {"error": "No download links found", "status": 404}
+        # Debug ke liye thoda HTML snippet return karo (production mein hata sakte ho)
+        snippet = html[:500].replace("\n", " ")
+        return {
+            "error": "No download links found",
+            "status": 404,
+            "debug_snippet": snippet,
+        }
 
     first = links[0]
     return {
@@ -95,14 +161,20 @@ async def handle_request(request: web.Request) -> web.Response:
 
     if not target_url:
         return web.json_response(
-            {"error": "url parameter required. e.g. /?url=https://new1.filesdl.in/cloud/ID"},
-            status=400
+            {
+                "error": (
+                    "url parameter required. "
+                    "e.g. /?url=https://new1.filesdl.in/cloud/ID"
+                )
+            },
+            status=400,
         )
 
+    # filesdl.in ke saare subdomains allow karo
     if "filesdl.in" not in target_url:
         return web.json_response(
             {"error": "Only filesdl.in URLs allowed"},
-            status=400
+            status=400,
         )
 
     result = await fetch_links(target_url)
