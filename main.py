@@ -1,7 +1,7 @@
 """
 FileDL Proxy Server
 GET /?url=https://new1.filesdl.in/cloud/ID
-Saare buttons decrypt karke JSON mein return karta hai.
+First download link return karta hai JSON mein.
 """
 
 import re
@@ -21,29 +21,16 @@ FILESDL_HEADERS = {
     "Referer": "https://filmyfly.faith/",
 }
 
-# Button class → label mapping
-CLASS_LABEL_MAP = {
-    "button2 download-link": "Cloud Direct",
-    "button2":               "Cloud Direct (Alt)",
-    "button":                "Fast Direct (10Gbps)",
-    "button1":               "Pixeldrain / Mirror",
-    "button4":               "Other",
-}
-
 def xor_decrypt(p: str, k: str) -> str:
-    a = base64.b64decode(p + "==")  # padding safe
+    a = base64.b64decode(p + "==")
     b = base64.b64decode(k + "==")
     return bytes([v ^ b[i % len(b)] for i, v in enumerate(a)]).decode("utf-8", errors="ignore")
 
 
 def extract_links(html: str) -> list[dict]:
-    """
-    Saare buttonv2-download-button spans se data-p/data-k decrypt karke links nikalo.
-    """
     results = []
     seen_urls = set()
 
-    # Span pattern: class, data-p, data-k, inner text
     pattern = re.compile(
         r'<span[^>]+class=[\'"]([^\'"]*buttonv2-download-button[^\'"]*)[\'"][^>]+'
         r'data-p=[\'"]([^\'"]+)[\'"][^>]+'
@@ -52,22 +39,11 @@ def extract_links(html: str) -> list[dict]:
     )
 
     for m in pattern.finditer(html):
-        classes_raw = m.group(1).strip()
-        data_p      = m.group(2).strip()
-        data_k      = m.group(3).strip()
-        inner_html  = m.group(4).strip()
+        data_p     = m.group(2).strip()
+        data_k     = m.group(3).strip()
+        inner_html = m.group(4).strip()
 
-        # Inner text (strip img tags)
-        label_text = re.sub(r'<[^>]+>', '', inner_html).strip()
-
-        # Class-based label fallback
-        btn_class = re.sub(r'\s*buttonv2-download-button\s*', '', classes_raw).strip()
-        # "download-link" wale class ko saaf karo
-        btn_key = re.sub(r'\s+', ' ', btn_class).strip()
-        class_label = CLASS_LABEL_MAP.get(btn_key, btn_key or "Download")
-
-        # Label: inner text prefer karo, fallback class label
-        label = label_text if label_text else class_label
+        label = re.sub(r'<[^>]+>', '', inner_html).strip()
 
         try:
             url = xor_decrypt(data_p, data_k)
@@ -81,10 +57,7 @@ def extract_links(html: str) -> list[dict]:
             continue
         seen_urls.add(url)
 
-        results.append({
-            "label": label,
-            "url":   url,
-        })
+        results.append({"label": label, "url": url})
 
     return results
 
@@ -97,11 +70,9 @@ async def fetch_links(target_url: str) -> dict:
                 return {"error": f"filesdl returned HTTP {resp.status}", "status": resp.status}
             html = await resp.text()
 
-    # Title
     title_m = re.search(r"<div class='title'>([^<]+)</div>", html)
     title = title_m.group(1).strip() if title_m else ""
 
-    # Size
     size_m = re.search(r"<div class='info'>Size:\s*([^<]+)</div>", html)
     size = size_m.group(1).strip() if size_m else ""
 
@@ -110,17 +81,16 @@ async def fetch_links(target_url: str) -> dict:
     if not links:
         return {"error": "No download links found", "status": 404}
 
+    first = links[0]
     return {
         "title": title,
         "size":  size,
-        "links": links,
+        "label": first["label"],
+        "url":   first["url"],
     }
 
 
 async def handle_request(request: web.Request) -> web.Response:
-    """
-    GET /?url=https://new1.filesdl.in/cloud/ID
-    """
     target_url = request.query.get("url", "").strip()
 
     if not target_url:
@@ -148,7 +118,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 app = web.Application()
-app.router.add_get("/",       handle_request)   # main endpoint
+app.router.add_get("/", handle_request)
 app.router.add_get("/health", handle_health)
 
 if __name__ == "__main__":
