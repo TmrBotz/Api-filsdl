@@ -1,9 +1,11 @@
 """
 FileDL Proxy Server
-Cloudflare Worker ke liye filesdl pages fetch karke direct URL return karta hai.
+GET /?url=https://new1.filesdl.in/cloud/ID
+Saare buttons decrypt karke JSON mein return karta hai.
 """
 
 import re
+import base64
 import asyncio
 import aiohttp
 from aiohttp import web
@@ -19,65 +21,126 @@ FILESDL_HEADERS = {
     "Referer": "https://filmyfly.faith/",
 }
 
+# Button class → label mapping
+CLASS_LABEL_MAP = {
+    "button2 download-link": "Cloud Direct",
+    "button2":               "Cloud Direct (Alt)",
+    "button":                "Fast Direct (10Gbps)",
+    "button1":               "Pixeldrain / Mirror",
+    "button4":               "Other",
+}
 
-async def fetch_direct_url(cloud_type: str, file_id: str) -> dict:
-    """
-    new1.filesdl.in/cloud/{id} page se direct download URL nikalo.
-    Priority 1: Pixeldrain
-    Priority 2: Cloud Direct (r2.dev)
-    Priority 3: Fast Direct (zdownload/fdownload)
-    """
-    target = f"https://new1.filesdl.in/{cloud_type}/{file_id}"
+def xor_decrypt(p: str, k: str) -> str:
+    a = base64.b64decode(p + "==")  # padding safe
+    b = base64.b64decode(k + "==")
+    return bytes([v ^ b[i % len(b)] for i, v in enumerate(a)]).decode("utf-8", errors="ignore")
 
+
+def extract_links(html: str) -> list[dict]:
+    """
+    Saare buttonv2-download-button spans se data-p/data-k decrypt karke links nikalo.
+    """
+    results = []
+    seen_urls = set()
+
+    # Span pattern: class, data-p, data-k, inner text
+    pattern = re.compile(
+        r'<span[^>]+class=[\'"]([^\'"]*buttonv2-download-button[^\'"]*)[\'"][^>]+'
+        r'data-p=[\'"]([^\'"]+)[\'"][^>]+'
+        r'data-k=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</span>',
+        re.DOTALL
+    )
+
+    for m in pattern.finditer(html):
+        classes_raw = m.group(1).strip()
+        data_p      = m.group(2).strip()
+        data_k      = m.group(3).strip()
+        inner_html  = m.group(4).strip()
+
+        # Inner text (strip img tags)
+        label_text = re.sub(r'<[^>]+>', '', inner_html).strip()
+
+        # Class-based label fallback
+        btn_class = re.sub(r'\s*buttonv2-download-button\s*', '', classes_raw).strip()
+        # "download-link" wale class ko saaf karo
+        btn_key = re.sub(r'\s+', ' ', btn_class).strip()
+        class_label = CLASS_LABEL_MAP.get(btn_key, btn_key or "Download")
+
+        # Label: inner text prefer karo, fallback class label
+        label = label_text if label_text else class_label
+
+        try:
+            url = xor_decrypt(data_p, data_k)
+        except Exception:
+            continue
+
+        if not url.startswith("http"):
+            continue
+
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        results.append({
+            "label": label,
+            "url":   url,
+        })
+
+    return results
+
+
+async def fetch_links(target_url: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(target, headers=FILESDL_HEADERS, allow_redirects=True) as resp:
+        async with session.get(target_url, headers=FILESDL_HEADERS, allow_redirects=True) as resp:
             if resp.status != 200:
                 return {"error": f"filesdl returned HTTP {resp.status}", "status": resp.status}
             html = await resp.text()
 
-    # Priority 1: Pixeldrain
-    pixel = re.search(r'href=\'(https://aws_amzdlbuket\.iwebp\.store/u/([^?\']+)\?download)\'', html)
-    if pixel:
-        pixel_id = pixel.group(2)
-        return {"url": f"https://pixeldrain.dev/api/file/{pixel_id}?download", "method": "Pixeldrain"}
+    # Title
+    title_m = re.search(r"<div class='title'>([^<]+)</div>", html)
+    title = title_m.group(1).strip() if title_m else ""
 
-    # Priority 2: Cloud Direct (r2.dev)
-    cloud = re.search(r'href=\'([^\']*r2\.dev[^\']+)\'\s*class=\'button2 download-link\'\s*data-id=\'0\'', html)
-    if cloud:
-        url = cloud.group(1).split("&token=")[0]
-        return {"url": url, "method": "Cloud Direct"}
+    # Size
+    size_m = re.search(r"<div class='info'>Size:\s*([^<]+)</div>", html)
+    size = size_m.group(1).strip() if size_m else ""
 
-    # Priority 3: Fast Direct (zdownload + fdownload)
-    fast = (
-        re.search(r'href=\'(https://bbbdownload\.filesdl\.in/(?:fdownload|zdownload)\.php[^\']+)\'', html) or
-        re.search(r'href=\'(https://bbdownload\.filesdl\.in/(?:fdownload|zdownload)\.php[^\']+)\'', html)
-    )
-    if fast:
-        return {"url": fast.group(1), "method": "Fast Direct"}
+    links = extract_links(html)
 
-    return {"error": "No download link found", "status": 404}
+    if not links:
+        return {"error": "No download links found", "status": 404}
+
+    return {
+        "title": title,
+        "size":  size,
+        "links": links,
+    }
 
 
 async def handle_request(request: web.Request) -> web.Response:
     """
-    GET /{type}/{id}
-    type: cloud ya drive
+    GET /?url=https://new1.filesdl.in/cloud/ID
     """
-    cloud_type = request.match_info.get("type")
-    file_id    = request.match_info.get("id")
+    target_url = request.query.get("url", "").strip()
 
-    if cloud_type not in ("cloud", "drive"):
-        return web.json_response({"error": "Invalid type — use /cloud/{id} or /drive/{id}"}, status=400)
+    if not target_url:
+        return web.json_response(
+            {"error": "url parameter required. e.g. /?url=https://new1.filesdl.in/cloud/ID"},
+            status=400
+        )
 
-    result = await fetch_direct_url(cloud_type, file_id)
+    if "filesdl.in" not in target_url:
+        return web.json_response(
+            {"error": "Only filesdl.in URLs allowed"},
+            status=400
+        )
+
+    result = await fetch_links(target_url)
 
     if "error" in result:
-        status = result.get("status", 500)
-        return web.json_response(result, status=status)
+        return web.json_response(result, status=result.get("status", 500))
 
-    # Direct redirect
-    return web.HTTPFound(result["url"])
+    return web.json_response(result)
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -85,9 +148,8 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 app = web.Application()
-app.router.add_get("/", handle_health)
+app.router.add_get("/",       handle_request)   # main endpoint
 app.router.add_get("/health", handle_health)
-app.router.add_get("/{type}/{id}", handle_request)
 
 if __name__ == "__main__":
     import os
