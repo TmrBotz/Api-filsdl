@@ -1,6 +1,7 @@
 """
 FileDL Proxy Server
 GET /?url=https://new1.filesdl.in/cloud/ID
+GET /?url=https://new1.filesdl.in/drive/ID
 First download link return karta hai JSON mein.
 """
 
@@ -22,10 +23,8 @@ FILESDL_HEADERS = {
 }
 
 def xor_decrypt(p: str, k: str) -> str:
-    def pad(s):
-        return s + "=" * (-len(s) % 4)  # ✅ FIXED: correct base64 padding
-    a = base64.b64decode(pad(p))
-    b = base64.b64decode(pad(k))
+    a = base64.b64decode(p + "=" * (-len(p) % 4))
+    b = base64.b64decode(k + "=" * (-len(k) % 4))
     return bytes([v ^ b[i % len(b)] for i, v in enumerate(a)]).decode("utf-8", errors="ignore")
 
 
