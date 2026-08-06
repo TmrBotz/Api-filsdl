@@ -1,10 +1,3 @@
-"""
-FileDL Proxy Server
-GET /?url=https://new1.filesdl.in/cloud/ID
-GET /?url=https://new1.filesdl.in/drive/ID
-First download link return karta hai JSON mein.
-"""
-
 import re
 import base64
 import asyncio
@@ -22,13 +15,17 @@ FILESDL_HEADERS = {
     "Referer": "https://filmyfly.faith/",
 }
 
+# Priority order for /drive/ page button classes
+DRIVE_BUTTON_PRIORITY = ["button2", "button", "button1", "button4"]
+
 def xor_decrypt(p: str, k: str) -> str:
-    a = base64.b64decode(p + "=" * (-len(p) % 4))
-    b = base64.b64decode(k + "=" * (-len(k) % 4))
+    a = base64.b64decode(p + "==")
+    b = base64.b64decode(k + "==")
     return bytes([v ^ b[i % len(b)] for i, v in enumerate(a)]).decode("utf-8", errors="ignore")
 
 
-def extract_links(html: str) -> list[dict]:
+def extract_links_cloud(html: str) -> list[dict]:
+    """For /cloud/ pages — uses XOR-encrypted span buttons."""
     results = []
     seen_urls = set()
 
@@ -43,7 +40,6 @@ def extract_links(html: str) -> list[dict]:
         data_p     = m.group(2).strip()
         data_k     = m.group(3).strip()
         inner_html = m.group(4).strip()
-
         label = re.sub(r'<[^>]+>', '', inner_html).strip()
 
         try:
@@ -51,16 +47,49 @@ def extract_links(html: str) -> list[dict]:
         except Exception:
             continue
 
-        if not url.startswith("http"):
-            continue
-
-        if url in seen_urls:
+        if not url.startswith("http") or url in seen_urls:
             continue
         seen_urls.add(url)
-
         results.append({"label": label, "url": url})
 
     return results
+
+
+def extract_links_drive(html: str) -> list[dict]:
+    """For /drive/ pages — uses plain <a href class='button*'> tags."""
+    results = []
+    seen_urls = set()
+
+    pattern = re.compile(
+        r"<a\s+href=['\"]([^'\"]+)['\"][^>]+class=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
+        re.DOTALL
+    )
+
+    # Collect all buttons with their class
+    found = []
+    for m in pattern.finditer(html):
+        url       = m.group(1).strip()
+        btn_class = m.group(2).strip()
+        label     = re.sub(r'<[^>]+>', '', m.group(3)).strip()
+
+        if not url.startswith("http") or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        found.append({"label": label, "url": url, "class": btn_class})
+
+    if not found:
+        return []
+
+    # Sort by priority: button2 > button > button1 > button4 > others
+    def priority(item):
+        cls = item["class"]
+        for i, p in enumerate(DRIVE_BUTTON_PRIORITY):
+            if cls == p:
+                return i
+        return len(DRIVE_BUTTON_PRIORITY)
+
+    found.sort(key=priority)
+    return [{"label": f["label"], "url": f["url"]} for f in found]
 
 
 async def fetch_links(target_url: str) -> dict:
@@ -71,13 +100,17 @@ async def fetch_links(target_url: str) -> dict:
                 return {"error": f"filesdl returned HTTP {resp.status}", "status": resp.status}
             html = await resp.text()
 
-    title_m = re.search(r"<div class='title'>([^<]+)</div>", html)
+    title_m = re.search(r"<div class=['\"]title['\"]>([^<]+)</div>", html)
     title = title_m.group(1).strip() if title_m else ""
 
-    size_m = re.search(r"<div class='info'>Size:\s*([^<]+)</div>", html)
+    size_m = re.search(r"<div class=['\"]info['\"]>Size:\s*([^<]+)</div>", html)
     size = size_m.group(1).strip() if size_m else ""
 
-    links = extract_links(html)
+    # Detect page type and extract accordingly
+    if "/drive/" in target_url:
+        links = extract_links_drive(html)
+    else:
+        links = extract_links_cloud(html)
 
     if not links:
         return {"error": "No download links found", "status": 404}
