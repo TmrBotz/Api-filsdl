@@ -1,5 +1,11 @@
+"""
+FileDL Proxy Server
+GET /?url=https://new1.filesdl.in/cloud/ID   → cloud page (POST-based)
+GET /?url=https://new1.filesdl.in/drive/ID   → drive page (anchor-based)
+First download link return karta hai JSON mein.
+"""
+
 import re
-import base64
 import asyncio
 import aiohttp
 from aiohttp import web
@@ -15,48 +21,139 @@ FILESDL_HEADERS = {
     "Referer": "https://filmyfly.faith/",
 }
 
-# Priority order for /drive/ page button classes
+# Priority order for cloud button actions (best first)
+CLOUD_ACTION_PRIORITY = ["cloudr2", "fastdirect", "hubcloud", "gdflix", "mediafire"]
+
+# Priority order for drive button classes (best first)
 DRIVE_BUTTON_PRIORITY = ["button2", "button", "button1", "button4"]
 
-def xor_decrypt(p: str, k: str) -> str:
-    a = base64.b64decode(p + "==")
-    b = base64.b64decode(k + "==")
-    return bytes([v ^ b[i % len(b)] for i, v in enumerate(a)]).decode("utf-8", errors="ignore")
+
+# ─────────────────────────── HELPERS ────────────────────────────
+
+def get_title_size(html: str):
+    title_m = re.search(r"<div[^>]+class=['\"]title['\"]>([^<]+)</div>", html)
+    title = title_m.group(1).strip() if title_m else ""
+
+    size_m = re.search(r"<div[^>]+class=['\"]info['\"]>Size:\s*([^<]+)</div>", html)
+    size = size_m.group(1).strip() if size_m else ""
+
+    return title, size
 
 
-def extract_links_cloud(html: str) -> list[dict]:
-    """For /cloud/ pages — uses XOR-encrypted span buttons."""
+# ─────────────────────────── CLOUD ──────────────────────────────
+
+def extract_buttons_cloud(html: str) -> list[dict]:
+    """
+    Parse <button class='... secure-download-button'
+                  data-action='...'
+                  data-button-code='...'>Label</button>
+    """
     results = []
-    seen_urls = set()
-
     pattern = re.compile(
-        r'<span[^>]+class=[\'"]([^\'"]*buttonv2-download-button[^\'"]*)[\'"][^>]+'
-        r'data-p=[\'"]([^\'"]+)[\'"][^>]+'
-        r'data-k=[\'"]([^\'"]+)[\'"][^>]*>(.*?)</span>',
+        r'<button[^>]+class=[\'"][^\'"]*secure-download-button[^\'"]*[\'"][^>]*'
+        r'data-action=[\'"]([^\'"]+)[\'"][^>]*'
+        r'data-button-code=[\'"]([^\'"]+)[\'"][^>]*>'
+        r'(.*?)</button>',
         re.DOTALL
     )
-
     for m in pattern.finditer(html):
-        data_p     = m.group(2).strip()
-        data_k     = m.group(3).strip()
-        inner_html = m.group(4).strip()
-        label = re.sub(r'<[^>]+>', '', inner_html).strip()
-
-        try:
-            url = xor_decrypt(data_p, data_k)
-        except Exception:
-            continue
-
-        if not url.startswith("http") or url in seen_urls:
-            continue
-        seen_urls.add(url)
-        results.append({"label": label, "url": url})
-
+        action      = m.group(1).strip()
+        button_code = m.group(2).strip()
+        label       = re.sub(r'<[^>]+>', '', m.group(3)).strip()
+        results.append({"action": action, "button_code": button_code, "label": label})
     return results
 
 
+async def resolve_cloud_link(session: aiohttp.ClientSession,
+                              page_url: str,
+                              file_id: str,
+                              action: str,
+                              button_code: str) -> str | None:
+    """
+    POST karo cloud page pe aur redirect URL lo.
+    filesdl server 302 redirect deta hai → final URL wahi hai.
+    """
+    post_url = f"https://new1.filesdl.in/cloud/{file_id}"
+    post_data = {
+        "id":          file_id,
+        "action":      action,
+        "button_code": button_code,
+    }
+    post_headers = {
+        **FILESDL_HEADERS,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer":       page_url,
+        "Origin":        "https://new1.filesdl.in",
+    }
+
+    try:
+        async with session.post(
+            post_url,
+            data=post_data,
+            headers=post_headers,
+            allow_redirects=True,
+            max_redirects=10,
+        ) as resp:
+            final_url = str(resp.url)
+            # Agar redirect hua aur URL alag hai toh wahi download link hai
+            if final_url != post_url and final_url.startswith("http"):
+                return final_url
+            # Kuch servers JSON mein URL dete hain
+            ct = resp.headers.get("Content-Type", "")
+            if "json" in ct:
+                data = await resp.json(content_type=None)
+                return data.get("url") or data.get("link") or data.get("download_url")
+    except Exception:
+        pass
+    return None
+
+
+async def fetch_links_cloud(session: aiohttp.ClientSession,
+                             target_url: str,
+                             html: str) -> dict:
+    # File ID extract karo URL se
+    id_match = re.search(r"/cloud/([^/?#]+)", target_url)
+    if not id_match:
+        return {"error": "Cloud ID URL se nahi mila", "status": 400}
+    file_id = id_match.group(1)
+
+    title, size = get_title_size(html)
+
+    buttons = extract_buttons_cloud(html)
+    if not buttons:
+        return {"error": "No download buttons found on cloud page", "status": 404}
+
+    # Priority ke hisaab se sort karo
+    def priority(btn):
+        try:
+            return CLOUD_ACTION_PRIORITY.index(btn["action"])
+        except ValueError:
+            return len(CLOUD_ACTION_PRIORITY)
+
+    buttons.sort(key=priority)
+
+    # Best button se shuru karo, fail hone par next try karo
+    for btn in buttons:
+        url = await resolve_cloud_link(
+            session, target_url, file_id, btn["action"], btn["button_code"]
+        )
+        if url:
+            return {
+                "title": title,
+                "size":  size,
+                "label": btn["label"],
+                "url":   url,
+            }
+
+    return {"error": "POST ke baad koi valid download URL nahi mila", "status": 502}
+
+
+# ─────────────────────────── DRIVE ──────────────────────────────
+
 def extract_links_drive(html: str) -> list[dict]:
-    """For /drive/ pages — uses plain <a href class='button*'> tags."""
+    """
+    Parse plain <a href='...' class='button*'>Label</a> tags.
+    """
     results = []
     seen_urls = set()
 
@@ -65,8 +162,6 @@ def extract_links_drive(html: str) -> list[dict]:
         re.DOTALL
     )
 
-    # Collect all buttons with their class
-    found = []
     for m in pattern.finditer(html):
         url       = m.group(1).strip()
         btn_class = m.group(2).strip()
@@ -75,45 +170,28 @@ def extract_links_drive(html: str) -> list[dict]:
         if not url.startswith("http") or url in seen_urls:
             continue
         seen_urls.add(url)
-        found.append({"label": label, "url": url, "class": btn_class})
+        results.append({"label": label, "url": url, "class": btn_class})
 
-    if not found:
+    if not results:
         return []
 
-    # Sort by priority: button2 > button > button1 > button4 > others
     def priority(item):
         cls = item["class"]
-        for i, p in enumerate(DRIVE_BUTTON_PRIORITY):
-            if cls == p:
-                return i
-        return len(DRIVE_BUTTON_PRIORITY)
+        try:
+            return DRIVE_BUTTON_PRIORITY.index(cls)
+        except ValueError:
+            return len(DRIVE_BUTTON_PRIORITY)
 
-    found.sort(key=priority)
-    return [{"label": f["label"], "url": f["url"]} for f in found]
+    results.sort(key=priority)
+    return [{"label": r["label"], "url": r["url"]} for r in results]
 
 
-async def fetch_links(target_url: str) -> dict:
-    timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(target_url, headers=FILESDL_HEADERS, allow_redirects=True) as resp:
-            if resp.status != 200:
-                return {"error": f"filesdl returned HTTP {resp.status}", "status": resp.status}
-            html = await resp.text()
-
-    title_m = re.search(r"<div class=['\"]title['\"]>([^<]+)</div>", html)
-    title = title_m.group(1).strip() if title_m else ""
-
-    size_m = re.search(r"<div class=['\"]info['\"]>Size:\s*([^<]+)</div>", html)
-    size = size_m.group(1).strip() if size_m else ""
-
-    # Detect page type and extract accordingly
-    if "/drive/" in target_url:
-        links = extract_links_drive(html)
-    else:
-        links = extract_links_cloud(html)
+async def fetch_links_drive(html: str) -> dict:
+    title, size = get_title_size(html)
+    links = extract_links_drive(html)
 
     if not links:
-        return {"error": "No download links found", "status": 404}
+        return {"error": "No download links found on drive page", "status": 404}
 
     first = links[0]
     return {
@@ -124,19 +202,42 @@ async def fetch_links(target_url: str) -> dict:
     }
 
 
+# ─────────────────────────── MAIN FETCH ─────────────────────────
+
+async def fetch_links(target_url: str) -> dict:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            target_url, headers=FILESDL_HEADERS, allow_redirects=True
+        ) as resp:
+            if resp.status != 200:
+                return {
+                    "error": f"filesdl returned HTTP {resp.status}",
+                    "status": resp.status,
+                }
+            html = await resp.text()
+
+        if "/drive/" in target_url:
+            return await fetch_links_drive(html)
+        else:
+            return await fetch_links_cloud(session, target_url, html)
+
+
+# ─────────────────────────── HANDLERS ───────────────────────────
+
 async def handle_request(request: web.Request) -> web.Response:
     target_url = request.query.get("url", "").strip()
 
     if not target_url:
         return web.json_response(
             {"error": "url parameter required. e.g. /?url=https://new1.filesdl.in/cloud/ID"},
-            status=400
+            status=400,
         )
 
     if "filesdl.in" not in target_url:
         return web.json_response(
             {"error": "Only filesdl.in URLs allowed"},
-            status=400
+            status=400,
         )
 
     result = await fetch_links(target_url)
@@ -150,6 +251,8 @@ async def handle_request(request: web.Request) -> web.Response:
 async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "filesdl-proxy"})
 
+
+# ─────────────────────────── APP ────────────────────────────────
 
 app = web.Application()
 app.router.add_get("/", handle_request)
