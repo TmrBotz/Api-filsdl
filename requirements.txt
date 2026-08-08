@@ -1,2 +1,2 @@
-cloudscraper
-aiohttp
+curl_cffi>=0.7.0
+aiohttp>=3.9.0
