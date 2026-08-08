@@ -240,17 +240,14 @@ async def handle_request(request: web.Request) -> web.Response:
 
             if not download_url:
                 return web.json_response({
-                    "error":  "Download URL resolve nahi hua",
-                    "action": best["action"],
-                    "label":  best["label"],
+                    "error": "Download URL resolve nahi hua",
                 }, status=502)
 
             return web.json_response({
-                "title":        title,
-                "size":         size,
-                "action":       best["action"],
-                "label":        best["label"],
-                "download_url": download_url,
+                "title": title,
+                "size":  size,
+                "label": best["label"],
+                "url":   download_url,
             })
 
         return web.json_response({"error": "URL /cloud/ ya /drive/ hona chahiye"}, status=400)
