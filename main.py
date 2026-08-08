@@ -2,18 +2,21 @@
 FileDL Proxy Server
 - Cloud links: GET redirect approach (JS se copy kiya)
 - Drive links: anchor tags extract karo
-- Cloudflare bypass: cloudscraper use karo
+- Cloudflare bypass: ScraperAPI use karo
 """
 
 import re
 import json
 import asyncio
+import requests
 from aiohttp import web
 from concurrent.futures import ThreadPoolExecutor
-from curl_cffi import requests as cffi_requests
 import os
 
 # ── Constants ─────────────────────────────────────────────────
+
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY", "2ce2548f2691683b0d0621a837b445bf")
+SCRAPERAPI_URL = "https://api.scraperapi.com"
 
 FILESDL_HEADERS = {
     "User-Agent": (
@@ -23,50 +26,55 @@ FILESDL_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "cross-site",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
+    "Referer": "https://filmyfly.faith/",
 }
 
-# Priority order for cloud buttons
 CLOUD_ACTION_PRIORITY = [
     "cloudr2", "fastdirect", "hubcloud", "gdflix",
     "mediafire", "gofile", "telegram"
 ]
 
-# Priority order for drive buttons (by class)
 DRIVE_BUTTON_PRIORITY = ["button2", "button", "button1", "button4"]
 
-# Thread pool for blocking cloudscraper calls
 executor = ThreadPoolExecutor(max_workers=10)
 
 
-# ── Session factory ───────────────────────────────────────────
+# ── ScraperAPI fetch ──────────────────────────────────────────
 
-def make_session() -> cffi_requests.Session:
+def scraper_get(url: str, allow_redirects: bool = True, referer: str = None) -> requests.Response:
     """
-    curl_cffi Session — actual Chrome TLS fingerprint use karta hai.
-    impersonate="chrome120" se Cloudflare bypass hota hai.
+    ScraperAPI ke through GET request.
+    render=true se JS execute hoga, CF bypass hoga.
     """
-    return cffi_requests.Session(impersonate="chrome120")
+    headers = dict(FILESDL_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+
+    params = {
+        "api_key":        SCRAPERAPI_KEY,
+        "url":            url,
+        "render":         "true",
+        "keep_headers":   "true",
+    }
+
+    resp = requests.get(
+        SCRAPERAPI_URL,
+        params=params,
+        headers=headers,
+        timeout=60,
+        allow_redirects=allow_redirects,
+    )
+    resp.raise_for_status()
+    return resp
 
 
-# ── Sync helpers (thread pool me run honge) ───────────────────
+# ── Sync helpers ──────────────────────────────────────────────
 
 def sync_fetch_page(url: str) -> tuple[str, str]:
-    """
-    Page fetch karo, (html, final_url) return karo.
-    Raises on non-200.
-    """
-    session = make_session()
-    resp = session.get(url, headers=FILESDL_HEADERS, timeout=30, allow_redirects=True)
-    resp.raise_for_status()
-    return resp.text, str(resp.url)
+    resp = scraper_get(url)
+    # ScraperAPI final URL X-Final-Url header mein deta hai
+    final_url = resp.headers.get("X-Final-Url", url)
+    return resp.text, final_url
 
 
 def sync_resolve_cloud_url(
@@ -76,16 +84,7 @@ def sync_resolve_cloud_url(
     button_code: str,
     token_btn: str,
 ) -> str | None:
-    """
-    JS ki tarah GET request karo with query params.
-    Cookies same session instance se persist hongi.
-    """
     from urllib.parse import urlparse, urlencode, urlunparse
-
-    session = make_session()
-
-    # Pehle page fetch karo taaki cookies set ho jayein
-    session.get(page_url, headers=FILESDL_HEADERS, timeout=30)
 
     parsed = urlparse(page_url)
     params = {
@@ -96,48 +95,47 @@ def sync_resolve_cloud_url(
     }
     redirect_url = urlunparse(parsed._replace(query=urlencode(params)))
 
-    get_headers = {
-        **FILESDL_HEADERS,
-        "Referer": page_url,
-    }
+    resp = scraper_get(redirect_url, referer=page_url)
 
-    # allow_redirects=False taaki pehla Location header mile
-    resp = session.get(redirect_url, headers=get_headers, timeout=30, allow_redirects=False)
+    # ScraperAPI redirects follow kar leta hai, final URL header mein
+    final_url = resp.headers.get("X-Final-Url", "")
+    if final_url and final_url != redirect_url:
+        return final_url
 
-    location = resp.headers.get("Location", "")
-    if location:
-        final = session.get(location, headers=get_headers, timeout=30, allow_redirects=True)
-        return str(final.url)
+    body = resp.text
 
-    if resp.status_code == 200:
-        body = resp.text
-        try:
-            data = json.loads(body)
-            return (
-                data.get("url")
-                or data.get("link")
-                or data.get("download_url")
-            )
-        except Exception:
-            pass
-        meta_m = re.search(
-            r'<meta[^>]+http-equiv=[\'"]refresh[\'"][^>]+'
-            r'content=[\'"][^;]+;\s*url=([^\'"]+)[\'"]',
-            body, re.IGNORECASE
+    # JSON response check
+    try:
+        data = json.loads(body)
+        return (
+            data.get("url")
+            or data.get("link")
+            or data.get("download_url")
         )
-        if meta_m:
-            return meta_m.group(1).strip()
-        href_m = re.search(
-            r'href=[\'"]([^\'"]+(?:download|dl|file)[^\'"]*)[\'"]',
-            body, re.IGNORECASE
-        )
-        if href_m:
-            return href_m.group(1).strip()
+    except Exception:
+        pass
+
+    # Meta refresh check
+    meta_m = re.search(
+        r'<meta[^>]+http-equiv=[\'"]refresh[\'"][^>]+'
+        r'content=[\'"][^;]+;\s*url=([^\'"]+)[\'"]',
+        body, re.IGNORECASE
+    )
+    if meta_m:
+        return meta_m.group(1).strip()
+
+    # Direct download href
+    href_m = re.search(
+        r'href=[\'"]([^\'"]+(?:download|dl|file)[^\'"]*)[\'"]',
+        body, re.IGNORECASE
+    )
+    if href_m:
+        return href_m.group(1).strip()
 
     return None
 
 
-# ── Pure parse helpers (no IO) ────────────────────────────────
+# ── Pure parse helpers ────────────────────────────────────────
 
 def get_title_size(html: str) -> tuple[str, str]:
     title_m = re.search(r"<div[^>]+class=['\"]title['\"]>([^<]+)</div>", html)
@@ -182,9 +180,9 @@ def pick_best_button(buttons: list[dict]) -> dict | None:
 
 
 def extract_links_drive(html: str) -> list[dict]:
-    results  = []
-    seen     = set()
-    pattern  = re.compile(
+    results = []
+    seen    = set()
+    pattern = re.compile(
         r"<a\s+href=['\"]([^'\"]+)['\"][^>]+class=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
         re.DOTALL
     )
@@ -218,22 +216,20 @@ async def handle_request(request: web.Request) -> web.Response:
         return web.json_response({"error": "url parameter required"}, status=400)
     if "filesdl.in" not in target_url:
         return web.json_response({"error": "Only filesdl.in URLs allowed"}, status=400)
+    if not SCRAPERAPI_KEY:
+        return web.json_response({"error": "SCRAPERAPI_KEY env not set"}, status=500)
 
     loop = asyncio.get_event_loop()
 
-    # ── Page fetch ────────────────────────────────────────────
     try:
         html, final_page_url = await loop.run_in_executor(
             executor, sync_fetch_page, target_url
         )
     except Exception as e:
         status = 502
-        msg    = str(e)
-        # requests HTTPError se status code nikalo
         if hasattr(e, "response") and e.response is not None:
             status = e.response.status_code
-            msg    = f"HTTP {status}"
-        return web.json_response({"error": msg}, status=status)
+        return web.json_response({"error": str(e)}, status=status)
 
     title, size = get_title_size(html)
 
@@ -290,7 +286,6 @@ async def handle_request(request: web.Request) -> web.Response:
 
 
 async def handle_debug(request: web.Request) -> web.Response:
-    """Sabhi buttons test karo — debugging ke liye."""
     target_url = request.query.get("url", "").strip()
     if not target_url or "filesdl.in" not in target_url:
         return web.json_response({"error": "valid filesdl.in url do"}, status=400)
@@ -309,8 +304,8 @@ async def handle_debug(request: web.Request) -> web.Response:
         return web.json_response({"error": "cloud ID nahi mila"}, status=400)
     file_id = id_match.group(1)
 
-    buttons      = extract_buttons_cloud(html)
-    title, size  = get_title_size(html)
+    buttons     = extract_buttons_cloud(html)
+    title, size = get_title_size(html)
 
     async def resolve_one(btn):
         try:
