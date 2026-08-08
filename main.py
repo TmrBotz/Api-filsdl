@@ -8,9 +8,9 @@ FileDL Proxy Server
 import re
 import json
 import asyncio
-import cloudscraper
 from aiohttp import web
 from concurrent.futures import ThreadPoolExecutor
+from curl_cffi import requests as cffi_requests
 import os
 
 # ── Constants ─────────────────────────────────────────────────
@@ -46,20 +46,14 @@ DRIVE_BUTTON_PRIORITY = ["button2", "button", "button1", "button4"]
 executor = ThreadPoolExecutor(max_workers=10)
 
 
-# ── Scraper factory ───────────────────────────────────────────
+# ── Session factory ───────────────────────────────────────────
 
-def make_scraper() -> cloudscraper.CloudScraper:
+def make_session() -> cffi_requests.Session:
     """
-    Ek fresh cloudscraper instance banao.
-    browser dict se actual Chrome fingerprint mimic hota hai.
+    curl_cffi Session — actual Chrome TLS fingerprint use karta hai.
+    impersonate="chrome120" se Cloudflare bypass hota hai.
     """
-    return cloudscraper.create_scraper(
-        browser={
-            "browser": "chrome",
-            "platform": "windows",
-            "mobile": False,
-        }
-    )
+    return cffi_requests.Session(impersonate="chrome120")
 
 
 # ── Sync helpers (thread pool me run honge) ───────────────────
@@ -69,10 +63,10 @@ def sync_fetch_page(url: str) -> tuple[str, str]:
     Page fetch karo, (html, final_url) return karo.
     Raises on non-200.
     """
-    scraper = make_scraper()
-    resp = scraper.get(url, headers=FILESDL_HEADERS, timeout=30, allow_redirects=True)
+    session = make_session()
+    resp = session.get(url, headers=FILESDL_HEADERS, timeout=30, allow_redirects=True)
     resp.raise_for_status()
-    return resp.text, resp.url
+    return resp.text, str(resp.url)
 
 
 def sync_resolve_cloud_url(
@@ -84,14 +78,14 @@ def sync_resolve_cloud_url(
 ) -> str | None:
     """
     JS ki tarah GET request karo with query params.
-    Cookies same scraper instance se persist hongi.
+    Cookies same session instance se persist hongi.
     """
     from urllib.parse import urlparse, urlencode, urlunparse
 
-    scraper = make_scraper()
+    session = make_session()
 
     # Pehle page fetch karo taaki cookies set ho jayein
-    scraper.get(page_url, headers=FILESDL_HEADERS, timeout=30)
+    session.get(page_url, headers=FILESDL_HEADERS, timeout=30)
 
     parsed = urlparse(page_url)
     params = {
@@ -107,18 +101,16 @@ def sync_resolve_cloud_url(
         "Referer": page_url,
     }
 
-    # allow_redirects=False taaki pehla Location header milے
-    resp = scraper.get(redirect_url, headers=get_headers, timeout=30, allow_redirects=False)
+    # allow_redirects=False taaki pehla Location header mile
+    resp = session.get(redirect_url, headers=get_headers, timeout=30, allow_redirects=False)
 
     location = resp.headers.get("Location", "")
     if location:
-        # Final redirect follow karo
-        final = scraper.get(location, headers=get_headers, timeout=30, allow_redirects=True)
-        return final.url
+        final = session.get(location, headers=get_headers, timeout=30, allow_redirects=True)
+        return str(final.url)
 
     if resp.status_code == 200:
         body = resp.text
-        # JSON me url check karo
         try:
             data = json.loads(body)
             return (
@@ -128,7 +120,6 @@ def sync_resolve_cloud_url(
             )
         except Exception:
             pass
-        # Meta refresh check
         meta_m = re.search(
             r'<meta[^>]+http-equiv=[\'"]refresh[\'"][^>]+'
             r'content=[\'"][^;]+;\s*url=([^\'"]+)[\'"]',
@@ -136,7 +127,6 @@ def sync_resolve_cloud_url(
         )
         if meta_m:
             return meta_m.group(1).strip()
-        # Direct download href
         href_m = re.search(
             r'href=[\'"]([^\'"]+(?:download|dl|file)[^\'"]*)[\'"]',
             body, re.IGNORECASE
